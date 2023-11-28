@@ -12,7 +12,7 @@
 ## Description
 A simple thread pool manager (alpha) for Unity that can be used together with coroutines.
 
-![](https://github.com/SERRVIEX/SimpleWindows/blob/main/github_assets/asset_0.png)
+![](https://github.com/SERRVIEX/SimpleThreadPool/blob/main/github_assets/asset_0.png)
 
 ## How to use?
 In the project a ```Test.cs``` script can be found, there are examples.
