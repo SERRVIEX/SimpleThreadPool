@@ -20,6 +20,8 @@ namespace SimpleThreadPool.Editors
 
         public override void OnInspectorGUI()
         {
+            serializedObject.Update();
+
             Settings();
             Info();
             Threads();
@@ -28,12 +30,51 @@ namespace SimpleThreadPool.Editors
                 EditorUtility.SetDirty(_target);
 
             Repaint();
+
+            if (GUI.changed)
+            {
+                serializedObject.ApplyModifiedProperties();
+                EditorUtility.SetDirty(target);
+            }
         }
 
         private void Settings()
         {
             AdvancedGUI.Headline("Settings");
             _target.EnableMultithreading = EditorGUILayout.Toggle("Enable Multithreading", _target.EnableMultithreading);
+
+            if (_target.EnableMultithreading)
+            {
+                SerializedProperty performance = serializedObject.FindProperty("_performance");
+                EditorGUILayout.PropertyField(performance, true);
+
+                // Leave one thread for the system.
+                int systemThread = 1;
+                // Leave one thread for the main thread.
+                int mainThread = 1;
+
+                int processorCount = SystemInfo.processorCount - mainThread - systemThread;
+
+                float percent = _target.Performance switch
+                {
+                    Performance.Low => 25f,
+                    Performance.Medium => 50f,
+                    Performance.High => 75f,
+                    Performance.Max => 100f,
+                    _ => 25f,
+                };
+
+                int maxThreads = (int)(percent * processorCount / 100f);
+                _target.TryGetThreads(maxThreads, out int lowPriorityThreads, out int highPriorityThreads);
+
+                EditorGUI.indentLevel++;
+                EditorGUILayout.LabelField("Total Threads", SystemInfo.processorCount.ToString());
+                EditorGUILayout.LabelField("System Thread", "1");
+                EditorGUILayout.LabelField("Main Thread", "1");
+                EditorGUILayout.LabelField("Low Priority Threads", lowPriorityThreads.ToString());
+                EditorGUILayout.LabelField("High Priority Threads", highPriorityThreads.ToString());
+                EditorGUI.indentLevel--;
+            }
         }
 
         private void Info()

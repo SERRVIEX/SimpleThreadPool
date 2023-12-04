@@ -2,6 +2,7 @@ namespace SimpleThreadPool
 {
     using System;
     using System.Collections;
+    using System.Collections.Concurrent;
     using System.Collections.Generic;
     using System.Threading;
     using UnityEngine;
@@ -36,7 +37,7 @@ namespace SimpleThreadPool
                 Job a1Job = _threadPool.Create("n10",  a1);
                 Job a2Job = _threadPool.Create("n100", a2);
                 Job a3Job = _threadPool.Create("n1000", a3);
-                List<Job> jobs = new List<Job>();   
+                ConcurrentBag<Job> jobs = new ConcurrentBag<Job>();   
                 jobs.Add(a1Job);
                 jobs.Add(a2Job);
                 jobs.Add(a3Job);

@@ -1,8 +1,8 @@
 namespace SimpleThreadPool
 {
     using System;
-    using System.Linq;
     using System.Collections.Generic;
+    using System.Collections.Concurrent;
 
     using UnityEngine;
 
@@ -27,6 +27,12 @@ namespace SimpleThreadPool
         /// Maximum available threads for the ThreadPool based on processor count.
         /// </summary>
         public int MaxThreads { get; private set; }
+
+        /// <summary>
+        /// How many threads will be used.
+        /// </summary>
+        public Performance Performance => _performance;
+        [SerializeField] private Performance _performance;
 
         /// <summary>
         /// List to store Worker instances representing threads in the ThreadPool.
@@ -72,16 +78,16 @@ namespace SimpleThreadPool
 
         // Jobs.
         private int _handleCounter = 0;
-        private Dictionary<int, Handler> _pendingLow = new Dictionary<int, Handler>();
-        private Dictionary<int, Handler> _pendingHigh = new Dictionary<int, Handler>();
+        private ConcurrentDictionary<int, Handler> _pendingLow = new ConcurrentDictionary<int, Handler>();
+        private ConcurrentDictionary<int, Handler> _pendingHigh = new ConcurrentDictionary<int, Handler>();
 
         public int PendingJobs => _pendingLow.Count + _pendingHigh.Count;
         public int TotalJobs => PendingJobs + BusyWorkerCount;
 
-        private Queue<int> _pendingToRemoveLow = new Queue<int>();
-        private Queue<int> _pendingToRemoveHigh = new Queue<int>();
+        private ConcurrentQueue<int> _pendingToRemoveLow = new ConcurrentQueue<int>();
+        private ConcurrentQueue<int> _pendingToRemoveHigh = new ConcurrentQueue<int>();
 
-        private Queue<JobHandler> _completedHandlers = new Queue<JobHandler>();
+        private ConcurrentQueue<JobHandler> _completedHandlers = new ConcurrentQueue<JobHandler>();
 
         // Methods
 
@@ -90,17 +96,99 @@ namespace SimpleThreadPool
         /// </summary>
         private void Awake()
         {
-            ProcessorCount = SystemInfo.processorCount;
-            MaxThreads = EnableMultithreading ? ProcessorCount - 1 : 1;
+            // Leave one thread for the system.
+            int systemThread = 1;
+            // Leave one thread for the main thread.
+            int mainThread = 1;
 
-            for (int i = 0; i < MaxThreads; i++)
+            ProcessorCount = SystemInfo.processorCount - mainThread - systemThread;
+
+            if(EnableMultithreading)
             {
-                Worker worker = new Worker(i, completedHandler => { }, completedJobHandler =>
+                float percent = Performance switch
                 {
-                    //_completedHandlers.Enqueue(completedJobHandler);
-                });
+                    Performance.Low => 25f,
+                    Performance.Medium => 50f,
+                    Performance.High => 75f,
+                    Performance.Max => 100f,
+                    _ => 25f,
+                };
 
-                _workers.Add(worker);
+                MaxThreads = (int)(percent * ProcessorCount / 100f);
+
+                TryGetThreads(MaxThreads, out int lowPriorityThreads, out int highPriorityThreads);
+
+                int index = 0;
+                for (int i = 0; i < lowPriorityThreads; i++)
+                {
+                    Worker worker = new Worker(index, HandlePriority.Low, completedHandler => { }, completedJobHandler =>
+                    {
+                        _completedHandlers.Enqueue(completedJobHandler);
+                    });
+
+                    _workers.Add(worker);
+                    index++;
+                }
+
+                for (int i = 0; i < highPriorityThreads; i++)
+                {
+                    Worker worker = new Worker(index, HandlePriority.High, completedHandler => { }, completedJobHandler =>
+                    {
+                        _completedHandlers.Enqueue(completedJobHandler);
+                    });
+
+                    _workers.Add(worker);
+                    index++;
+                }
+            }
+            else
+            {
+                MaxThreads = 1;
+                for (int i = 0; i < MaxThreads; i++)
+                {
+                    Worker worker = new Worker(i, HandlePriority.Low, completedHandler => { }, completedJobHandler =>
+                    {
+                        _completedHandlers.Enqueue(completedJobHandler);
+                    });
+
+                    _workers.Add(worker);
+                }
+            }
+        }
+
+        public void TryGetThreads(int maxThreads, out int lowPriorityThreads, out int highPriorityThreads)
+        {
+            if (maxThreads <= 0)
+                throw new Exception("The number of threads in the thread pool must be greater than zero.");
+
+            switch (maxThreads)
+            {
+                case 1:
+                    lowPriorityThreads = 1;
+                    highPriorityThreads = 0;
+                    break;
+
+                case 2:
+                case 3:
+                case 4:
+                case 5:
+                case 6:
+                    highPriorityThreads = 1;
+                    lowPriorityThreads = maxThreads - highPriorityThreads;
+                    break;
+
+                case 7:
+                case 8:
+                case 9:
+                case 10:
+                    highPriorityThreads = 2;
+                    lowPriorityThreads = maxThreads - highPriorityThreads;
+                    break;
+
+                default:
+                    highPriorityThreads = 3;
+                    lowPriorityThreads = maxThreads - highPriorityThreads;
+                    break;
             }
         }
 
@@ -110,11 +198,12 @@ namespace SimpleThreadPool
         private void Update()
         {
             while (_completedHandlers.Count > 0)
-                _completedHandlers.Dequeue().Complete();
+                if(_completedHandlers.TryDequeue(out JobHandler jobHandler))
+                    jobHandler.Complete();
 
             foreach (var item in _pendingHigh)
             {
-                if (!Handle(item.Value))
+                if (!HandleWithRemove(item.Value))
                 {
                     ClearPendingToRemoveJobs();
                     return;
@@ -125,7 +214,7 @@ namespace SimpleThreadPool
 
             foreach (var item in _pendingLow)
             {
-                if (!Handle(item.Value))
+                if (!HandleWithRemove(item.Value))
                 {
                     ClearPendingToRemoveJobs();
                     return;
@@ -149,59 +238,60 @@ namespace SimpleThreadPool
         public Handler Handle(Job job, HandlePriority priority = HandlePriority.Low)
         {
             _handleCounter++;
-            return HandleImpl(new List<Job>() { job }, priority);
+            return HandleImpl(new ConcurrentBag<Job>() { job }, priority);
         }
 
         public Handler Handle(Job job, out int identifier, HandlePriority priority = HandlePriority.Low)
         { 
             _handleCounter++;
             identifier = _handleCounter;
-            return HandleImpl(new List<Job>() { job }, priority);
+            return HandleImpl(new ConcurrentBag<Job>() { job }, priority);
         }
 
         public Handler Handle(Job[] jobs, HandlePriority priority = HandlePriority.Low)
         {  
             _handleCounter++;
-            return HandleImpl(jobs.ToList(), priority);
+            ConcurrentBag<Job> concurrentBug = new ConcurrentBag<Job>();
+            for (int i = 0; i < jobs.Length; i++)
+                concurrentBug.Add(jobs[i]);
+            return HandleImpl(concurrentBug, priority);
         }
 
         public Handler Handle(Job[] jobs, out int identifier, HandlePriority priority = HandlePriority.Low)
         {  
             _handleCounter++;
             identifier = _handleCounter;
-            return HandleImpl(jobs.ToList(), priority);
+            ConcurrentBag<Job> concurrentBug = new ConcurrentBag<Job>();
+            for (int i = 0; i < jobs.Length; i++)
+                concurrentBug.Add(jobs[i]);
+            return HandleImpl(concurrentBug, priority);
         }
 
-        public Handler Handle(List<Job> jobs, HandlePriority priority = HandlePriority.Low)
+        public Handler Handle(ConcurrentBag<Job> jobs, HandlePriority priority = HandlePriority.Low)
         { 
             _handleCounter++;
             return HandleImpl(jobs, priority);
         }
 
-        public Handler Handle(List<Job> jobs, out int identifier, HandlePriority priority = HandlePriority.Low)
+        public Handler Handle(ConcurrentBag<Job> jobs, out int identifier, HandlePriority priority = HandlePriority.Low)
         {
             _handleCounter++;
             identifier = _handleCounter;
             return HandleImpl(jobs, priority);
         }
 
-        private Handler HandleImpl(List<Job> jobs, HandlePriority priority = HandlePriority.Low)
+        private Handler HandleImpl(ConcurrentBag<Job> jobs, HandlePriority priority = HandlePriority.Low)
         {
-            Handler handler = new Handler(_handleCounter, jobs);
+            Handler handler = new Handler(_handleCounter, jobs, priority);
 
             if(!Handle(handler))
             {
                 // If no more available workers there then add it to pending and break.
-                switch (priority)
-                {
-                    case HandlePriority.Low:
-                        _pendingLow.Add(_handleCounter, handler);
-                        return handler;
+                if (priority == HandlePriority.Low)
+                    _pendingLow.TryAdd(_handleCounter, handler);
 
-                    case HandlePriority.High:
-                        _pendingHigh.Add(_handleCounter, handler);
-                        return handler;
-                }
+                else
+                    _pendingHigh.TryAdd(_handleCounter, handler);
             }
 
             return handler;
@@ -213,7 +303,7 @@ namespace SimpleThreadPool
             while (handler.Count > 0)
             {
                 // Find an available worker.
-                Worker worker = GetAvailableWorker();
+                Worker worker = GetAvailableWorker(handler.Priority);
 
                 if (worker != null)
                 {
@@ -224,6 +314,14 @@ namespace SimpleThreadPool
                 else
                     return false;
             }
+
+            return true;
+        }
+
+        private bool HandleWithRemove(Handler handler)
+        {
+            if(!Handle(handler))
+                return false;
 
             if (handler.Priority == HandlePriority.Low)
                 _pendingToRemoveLow.Enqueue(handler.Identifier);
@@ -236,17 +334,22 @@ namespace SimpleThreadPool
         private void ClearPendingToRemoveJobs()
         {
             while (_pendingToRemoveHigh.Count > 0)
-                _pendingHigh.Remove(_pendingToRemoveHigh.Dequeue());
+                if (_pendingToRemoveHigh.TryDequeue(out int result))
+                    _pendingHigh.TryRemove(result, out _);
 
             while (_pendingToRemoveLow.Count > 0)
-                _pendingLow.Remove(_pendingToRemoveLow.Dequeue());
+                if (_pendingToRemoveLow.TryDequeue(out int result))
+                    _pendingLow.Remove(result, out _);
         }
 
-        private Worker GetAvailableWorker()
+        private Worker GetAvailableWorker(HandlePriority priority)
         {
             for (int i = 0; i < _workers.Count; i++)
-                if (_workers[i].CurrentJobHandler == null)
-                    return _workers[i];
+            {
+                Worker worker = _workers[i];
+                if (worker.Priority == priority && worker.CurrentJobHandler == null)
+                    return worker;
+            }
 
             return null;
         }
@@ -254,10 +357,10 @@ namespace SimpleThreadPool
         public void Stop(int identifier)
         {
             if (_pendingLow.ContainsKey(identifier))
-                _pendingLow.Remove(identifier);
+                _pendingLow.TryRemove(identifier, out _);
 
             if (_pendingHigh.ContainsKey(identifier))
-                _pendingHigh.Remove(identifier);
+                _pendingHigh.TryRemove(identifier, out _);
 
             for (int i = 0; i < _workers.Count; i++)
             {

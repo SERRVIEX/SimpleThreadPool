@@ -1,8 +1,12 @@
+#define SIMPLE_THREAD_POOL_DEBUG
+
 namespace SimpleThreadPool.Internal
 {
     using System;
     using System.Threading;
     using System.Diagnostics;
+
+    using UnityEngine.Profiling;
 
     using Debug = UnityEngine.Debug;
 
@@ -13,6 +17,7 @@ namespace SimpleThreadPool.Internal
     {
         private int _index;
         private Thread _thread;
+        public HandlePriority Priority { get; private set; }
 
         public WorkerState CurrentState { get; private set; }
 
@@ -37,11 +42,15 @@ namespace SimpleThreadPool.Internal
         /// </summary>
         private Stopwatch _jobHandlerStopwatch;
 
+        private readonly object _lockWorker = new object();
+        private readonly object _lockThreadStopwatches = new object();
+
         // Constructors
 
-        public Worker(int index, Action<Handler> onCompleteHandler, Action<JobHandler> onCompleteJobHandler)
+        public Worker(int index, HandlePriority priority, Action<Handler> onCompleteHandler, Action<JobHandler> onCompleteJobHandler)
         {
             _index = index;
+            Priority = priority;
             _onCompleteHandler = onCompleteHandler;
             _onCompleteJobHandler = onCompleteJobHandler;
 
@@ -110,57 +119,63 @@ namespace SimpleThreadPool.Internal
             int milliseconds = 16;
             while (true)
             {
-                if (CurrentJobHandler != null)
+                lock (_lockWorker)
                 {
+                    if (CurrentJobHandler != null)
+                    {
 #if SIMPLE_THREAD_POOL_DEBUG
-                    var profilerSample = CustomSampler.Create(Handler.Job.Name);
+                    var profilerSample = CustomSampler.Create(CurrentJobHandler.Job.Name);
                     Profiler.BeginThreadProfiling("SimpleThreadPool", "Worker " + _index);
                     profilerSample.Begin();
 #endif
 
-                    try
-                    {
-                        _jobHandlerStopwatch.Reset();
-                        _jobHandlerStopwatch.Start();
-                        CurrentJobHandler.Execute();
-                        CurrentJobHandler.Complete();
-                        _jobHandlerStopwatch.Stop();
+                        try
+                        {
+                            _jobHandlerStopwatch.Reset();
+                            _jobHandlerStopwatch.Start();
+                            CurrentJobHandler.Execute();
+                            CurrentJobHandler.Complete();
+                            _jobHandlerStopwatch.Stop();
 
-                        _onCompleteJobHandler.Invoke(CurrentJobHandler);
-                        if (CurrentHandler.Count == 0)
-                            _onCompleteHandler.Invoke(CurrentHandler);
+                            _onCompleteJobHandler.Invoke(CurrentJobHandler);
+                            if (CurrentHandler.Count == 0)
+                                _onCompleteHandler.Invoke(CurrentHandler);
 
-                        CurrentHandler = null;
-                        CurrentJobHandler = null;
+                            CurrentHandler = null;
+                            CurrentJobHandler = null;
 
-                        // After executing a job, timeout should be started.
-                        _threadTimeoutStopwatch.Reset();
-                        _threadTimeoutStopwatch.Start();
+                            // After executing a job, timeout should be started.
+                            _threadTimeoutStopwatch.Reset();
+                            _threadTimeoutStopwatch.Start();
 
-                        CurrentState = WorkerState.Idling;
-                    }
-                    catch (Exception ex)
-                    {
-                        Debug.LogError(ex);
-                    }
+                            CurrentState = WorkerState.Idling;
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.LogError(ex);
+                        }
 
 #if SIMPLE_THREAD_POOL_DEBUG
                     profilerSample.End();
                     Profiler.EndThreadProfiling();
 #endif
-                }
-                else
-                {
-                    // If the thread is running and no job was
-                    // executed within timeout range, then stop it.
-                    if (_threadTimeoutStopwatch.Elapsed.TotalMilliseconds >= _timeout)
-                    {
-                        Sleep();
-                        return;
                     }
-                }
+                    else
+                    {
+                        lock (_lockThreadStopwatches)
+                        {
+                            // If the thread is running and no job was
+                            // executed within timeout range, then stop it.
+                            if (_threadTimeoutStopwatch.Elapsed.TotalMilliseconds >= _timeout)
+                            {
+                                Sleep();
+                                return;
+                            }
+                        }
+                    }
 
-                Thread.Sleep(milliseconds);
+                    Thread.Sleep(milliseconds);
+                }
             }
         }
 
@@ -169,21 +184,23 @@ namespace SimpleThreadPool.Internal
         /// </summary>
         private void Sleep()
         {
-            CurrentState = WorkerState.Sleeping;
+            lock (_lockWorker)
+            {
+                CurrentState = WorkerState.Sleeping;
 
-            // Stop the thread
-            try { _thread?.Abort(); }
-            catch { }
+                // Stop the thread
+                try { _thread?.Abort(); }
+                catch { }
 
-            _thread = null;
+                _thread = null;
 
-            // Reset the current job handler.
-            CurrentHandler = null;
-            CurrentJobHandler = null;
+                // Reset the current job handler.
+                CurrentHandler = null;
+                CurrentJobHandler = null;
 
-            _jobHandlerStopwatch.Stop();
-            _threadTimeoutStopwatch.Stop();
-
+                _jobHandlerStopwatch.Stop();
+                _threadTimeoutStopwatch.Stop();
+            }
         }
 
         /// <summary>
@@ -213,7 +230,7 @@ namespace SimpleThreadPool.Internal
         /// </summary>
         public WorkerInfo GetWorkerInfo()
         {
-            string name = $"Worker {_index}";
+            string name = $"Worker {_index} ({Priority})";
             string jobHandler = CurrentJobHandler != null ? CurrentJobHandler.Name : null;
             return new WorkerInfo(name, CurrentState, _threadTimeoutStopwatch.Elapsed.TotalSeconds, jobHandler, _jobHandlerStopwatch.Elapsed.TotalSeconds);
         }
